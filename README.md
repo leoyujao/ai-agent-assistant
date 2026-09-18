@@ -59,8 +59,8 @@
 ### 1. 克隆项目
 
 ```bash
-git clone https://github.com/YOUR_USERNAME/my-agent.git
-cd my-agent
+git clone https://github.com/YOUR_USERNAME/ai-agent-assistant.git
+cd ai-agent-assistant
 ```
 
 ### 2. 配置环境变量
@@ -105,7 +105,7 @@ cd frontend && npm run dev
 ## 📁 项目结构
 
 ```
-my-agent/
+ai-agent-assistant/
 ├── agent.py              # Agent 核心（工具装配、LLM 接入、评审循环）
 ├── api.py                # FastAPI 后端（REST API + SSE 流式对话）
 ├── rag.py                # RAG 知识库（文档加载、分块、向量化、检索）
