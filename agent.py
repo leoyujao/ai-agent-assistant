@@ -362,6 +362,11 @@ SYSTEM_PROMPT = """你是一个友好、专业的 AI 助手。
 6. 如果不需要工具，直接回答即可
 7. 请用中文回答，回答要简洁清晰
 
+回答风格规则（重要）：
+- 直接给出结论和答案。不要在开头复述检索过程、罗列检索时用过的关键词，也不要写“我重新检索一次”“已实际检索知识库”“以下内容均来自工具返回的原文”这类元叙述
+- 需要表明依据时，正文里直接陈述即可，不要反复强调“均有文档支撑”；引用来源由界面在文末统一展示，无需你在正文里逐个声明
+- 组织内容时用小标题或列表分点，不要把多个小标题串成一整段文字
+
 防幻觉规则（重要）：
 - 当 search_knowledge_base 返回"知识库为空"或"未找到相关内容"时，必须诚实告知用户"当前知识库中没有找到与您问题相关的信息"，严禁编造文档名称、内容或数据
 - 当 web_search 返回"未找到相关搜索结果"时，应如实说明，不要编造搜索结果
@@ -558,6 +563,14 @@ async def chat_stream(agent, user_input: str, thread_id: str = "default"):
         tool_events: list[str] = []     # 收集工具证据供评审
         worker_events: list[dict] = []  # 缓存本轮工具相关事件
 
+        # ReAct 循环中每轮 LLM 调用都会触发 on_chat_model_stream。中间轮次的文本是
+        # 「决定调用工具前」的推理（往往在复述检索关键词），不属于给用户的答案；
+        # 若与最终答案直接拼接，会粘成一段跑题的开场白。故按轮次缓冲，一旦该轮
+        # 触发了工具调用就整体丢弃。
+        turn_text = ""
+        turn_chunks: list[dict] = []
+        all_chunks: list[dict] = []     # 兜底：所有轮次的 chunk
+
         async for event in agent.astream_events(
             {"messages": [HumanMessage(content=user_input)]},
             config=config,
@@ -565,16 +578,27 @@ async def chat_stream(agent, user_input: str, thread_id: str = "default"):
         ):
             kind = event["event"]
 
-            if kind == "on_chat_model_stream":
+            if kind == "on_chat_model_start":
+                # 每轮 LLM 真正开始时清空缓冲。这一步同时兜住一个副作用：
+                # rewrite_query 是在本循环体内同步调用的，它的 LLM 调用会继承
+                # 当前回调上下文，其流式事件被同一个 astream_events 捕获，
+                # 于是「改写后的查询」会混进来。轮次开始即清空可将其丢弃。
+                turn_text = ""
+                turn_chunks = []
+
+            elif kind == "on_chat_model_stream":
                 chunk = event["data"]["chunk"]
                 text = _extract_text(chunk.content)
                 if text:
-                    full_text += text
                     chunk_event = _event("message_chunk", "llm", {"text": text})
-                    draft_chunks.append(chunk_event)
-                    worker_events.append(chunk_event)
+                    turn_text += text
+                    turn_chunks.append(chunk_event)
+                    all_chunks.append(chunk_event)
 
             elif kind == "on_tool_start":
+                # 该轮文本属于调用工具前的推理，丢弃，不计入答案
+                turn_text = ""
+                turn_chunks = []
                 tool_input = event.get("data", {}).get("input", {})
                 if event["name"] == "search_knowledge_base":
                     original_q = tool_input.get("query", "") if isinstance(tool_input, dict) else str(tool_input)
@@ -607,6 +631,15 @@ async def chat_stream(agent, user_input: str, thread_id: str = "default"):
                 tr_event = _event("tool_result", "tool", result_data)
                 worker_events.append(tr_event)
                 tool_events.append(f"工具结果 [{event['name']}]: {output_text[:500]}")
+
+        # 最终答案只取最后一个未触发工具调用的轮次文本
+        if turn_text:
+            full_text = turn_text
+            draft_chunks = turn_chunks
+        else:
+            # 兜底：所有轮次都调用了工具（理论上不会发生），退回完整拼接
+            full_text = "".join(c["data"]["text"] for c in all_chunks)
+            draft_chunks = all_chunks
 
         # ── 输出工具事件（所有轮次都输出，用户能看到执行过程） ──
         for ev in worker_events:
