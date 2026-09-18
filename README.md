@@ -35,6 +35,42 @@
 
 ---
 
+## 🏗 架构总览
+
+```mermaid
+graph LR
+    User["💬 Vue3 Chat UI<br/>localhost:5173"]
+    API["⚡ FastAPI<br/>api.py · localhost:8000"]
+    Agent["🧠 LangGraph ReAct Agent<br/>agent.py"]
+    Review["🔍 Reviewer<br/>事实性 / 幻觉 / 完整性"]
+    LLM["☁️ DeepSeek-v4<br/>Anthropic 兼容接口"]
+
+    Search["🔎 search MCP Server<br/>web_search"]
+    Browser["🌐 browser MCP Server<br/>url_reader"]
+    FAISS[("📚 FAISS<br/>bge-small-zh-v1.5")]
+    SQLite[("💾 AsyncSqliteSaver<br/>checkpoints.db")]
+    LangSmith["📊 LangSmith"]
+
+    User -->|"POST /api/chat · SSE 流式"| API
+    User -->|"POST /api/upload · 上传 .docx"| API
+
+    API -->|"astream_events"| Agent
+    Agent <-->|"草稿 ⇄ 审查反馈<br/>最多 3 轮"| Review
+    Agent -->|"LLM 调用"| LLM
+
+    Agent -->|"stdio 子进程"| Search
+    Agent -->|"stdio 子进程"| Browser
+    Agent -->|"search_knowledge_base"| FAISS
+    Agent -->|"checkpoint 会话持久化"| SQLite
+    Agent -.->|"全链路 trace 自动上报"| LangSmith
+```
+
+**一条请求的链路**：前端 `POST /api/chat` → FastAPI 只传 `thread_id`（历史由 checkpointer 自动恢复）→ LangGraph ReAct Agent 推理 → 按需调用本地工具或 MCP 工具 → Worker 出稿、Reviewer 审查、不通过则带着反馈重写 → 评审通过后经 SSE 逐 token 推回前端。
+
+> 模块级架构图与完整时序图见 [PROJECT.md](PROJECT.md#整体架构)。
+
+---
+
 ## 🛠 技术栈
 
 | 层 | 技术 |

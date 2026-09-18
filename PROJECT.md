@@ -19,37 +19,106 @@ Agent 具备 **6 大工具调用能力**（实时时钟、数学计算器、RAG 
 
 ## 整体架构
 
+### 模块视图
+
+```mermaid
+graph LR
+    ChatView["💬 ChatView<br/>useChat.js · SSE Hook"]
+    KnowledgeView["📚 KnowledgeView<br/>知识库管理"]
+    LS[("localStorage<br/>threadId + messages")]
+
+    API["⚡ api.py<br/>FastAPI · REST + SSE"]
+    AgentCore["🧠 agent.py<br/>LangGraph ReAct Agent"]
+    Reviewer["🔍 Reviewer<br/>纯 LLM 审查"]
+
+    Local["🔧 本地 @tool<br/>get_current_time · calculator<br/>search_knowledge_base · python_executor"]
+    MCPClient["🔌 MultiServerMCPClient<br/>langchain-mcp-adapters"]
+    SearchSrv["🔎 mcp_servers/search.py<br/>web_search · ddgs"]
+    BrowserSrv["🌐 mcp_servers/browser.py<br/>url_reader · requests + bs4"]
+    RAG["📄 rag.py<br/>知识库模块"]
+
+    LLM["☁️ DeepSeek-v4<br/>Anthropic 兼容接口"]
+    FAISS[("FAISS 向量库<br/>bge-small-zh-v1.5<br/>vectorstore/")]
+    SQLite[("AsyncSqliteSaver<br/>checkpoints.db")]
+    LangSmith["📊 LangSmith<br/>全链路追踪"]
+
+    ChatView -.-> LS
+    ChatView -->|"POST /api/chat · SSE 流式"| API
+    KnowledgeView -->|"POST /api/upload · GET /api/kb/status"| API
+
+    API -->|"lifespan 异步初始化"| AgentCore
+    AgentCore -->|"astream_events"| LLM
+    AgentCore -->|"草稿送审"| Reviewer
+    Reviewer -->|"revise 反馈 / LLM 调用"| LLM
+
+    AgentCore --> Local
+    AgentCore --> MCPClient
+    MCPClient -->|"stdio 子进程"| SearchSrv
+    MCPClient -->|"stdio 子进程"| BrowserSrv
+    Local -->|"search_knowledge_base"| RAG
+    RAG -->|"相似度检索"| FAISS
+
+    AgentCore -->|"rewrite_query 查询改写"| LLM
+    AgentCore -->|"checkpoint 会话持久化"| SQLite
+    AgentCore -.->|"环境变量开启 · 零代码接入"| LangSmith
 ```
-Vue3 前端 (localhost:5173)
-   │  POST /api/chat  ←→  SSE 统一协议 {type, run_id, thread_id, step, data}
-   │  POST /api/upload      （前端通过 localStorage 持久化 threadId + messages）
-   │  GET  /api/kb/status
-   ↓
-[api.py] FastAPI 后端 (localhost:8000)
-   │  lifespan 异步初始化 Agent
-   │  仅传 thread_id，checkpointer 自动管理历史
-   ↓
-[agent.py] LangGraph ReAct Agent + AsyncSqliteSaver
-   │  checkpointer: AsyncSqliteSaver → checkpoints.db（SQLite 持久化）
-   │  rewrite_query(): RAG 检索前用 LLM 改写查询（提升召回率）
-   │  load_mcp_tools(): 动态装配 MCP Server 工具（每次调用临时拉起子进程）
-   │  ┌─ 多 Agent 协作循环（最多 3 轮）───────────────────────────────────┐
-   │  │ Worker (ReAct Agent) 生成草稿 ─→ Reviewer (纯 LLM) 审查  │
-   │  │   不通过（revise）→ 注入反馈，Worker 重新生成             │
-   │  │   通过（pass）/ 达到上限 → 输出最终回复                   │
-   │  └────────────────────────────────────────────────────────────┘
-   ↓ 判断是否需要调用工具
-[本地工具] get_current_time / calculator / search_knowledge_base / python_executor
-[MCP 工具] web_search / url_reader （通过 stdio 子进程调用）
-   ↓                              ↓
-   ↓                    [rag.py] FAISS 向量检索
-   ↓                    [mcp_servers/search.py]  ← stdio 子进程 (ddgs)
-   ↓                    [mcp_servers/browser.py] ← stdio 子进程 (requests + bs4)
-   ↓                              ↓
-   ↓ 返回工具结果
-[agent.py] LLM 生成最终回复（评审通过后输出）
-   ↓
-[api.py] SSE 流式推送到前端
+
+**关键设计点**
+
+- **后端无状态**：`/api/chat` 只接收 `message` + `thread_id`，会话历史由 `AsyncSqliteSaver` checkpointer 自动管理与恢复，前端不传历史。
+- **MCP 工具延迟装配**：`load_mcp_tools()` 在 `build_agent()` 时通过 `MultiServerMCPClient` 拉起 stdio 子进程；装配失败降级为空列表，服务仍可用（仅本地工具），`/api/health` 报 `mcp_tools: degraded`。
+- **向量库后台加载**：`lifespan` 中 Agent 同步初始化、向量库放入后台任务，请求侧通过 `_wait_vectorstore()` 等待就绪（上限 120s），避免启动窗口内把「加载中」误判为「知识库为空」。
+- **评审不阻塞**：`_review_draft()` 任何异常都返回 `{"verdict": "pass"}`，评审故障不影响正常回复。
+
+### 一次对话的完整时序
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant U as Vue3 前端
+    participant A as api.py
+    participant G as LangGraph Agent
+    participant T as 工具 / RAG / MCP
+    participant R as Reviewer
+    participant L as DeepSeek-v4
+
+    U->>A: POST /api/chat {message, thread_id}
+    A->>A: _wait_vectorstore() 等待向量库就绪
+    A->>G: chat_stream(agent, message, thread_id)
+    G->>G: checkpointer 按 thread_id 恢复历史
+
+    loop 最多 MAX_REVIEW_ROUNDS + 1 轮
+        G->>L: astream_events 推理
+        L-->>G: token 流
+        G-->>U: message_chunk 逐 token 推送
+
+        opt 需要检索知识库
+            G->>L: rewrite_query 改写查询
+            L-->>G: 改写结果
+            G-->>U: query_rewrite {original, rewritten}
+        end
+
+        opt 需要调用工具
+            G-->>U: tool_call {name, input}
+            G->>T: 本地工具 / MCP 子进程 / FAISS 检索
+            T-->>G: 工具结果
+            G-->>U: tool_result {name, output}
+        end
+
+        G-->>U: review_start {round}
+        G->>R: 提交草稿 + 证据
+        R->>L: 三维度审查（事实性 / 幻觉 / 完整性）
+        L-->>R: verdict + feedback
+        R-->>G: verdict + feedback
+        G-->>U: review_result {round, verdict, feedback}
+
+        alt verdict = revise
+            G->>G: 注入反馈，重新生成草稿
+        end
+    end
+
+    G-->>A: done {完整回复}
+    A-->>U: data: {"type": "done", ...}
 ```
 
 ---
