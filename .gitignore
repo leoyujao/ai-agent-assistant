@@ -38,6 +38,8 @@ vectorstore/
 # ========================
 frontend/node_modules/
 frontend/dist/
+.vite/
+frontend/.vite/
 
 # ========================
 # IDE / 本地缓存
