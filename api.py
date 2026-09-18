@@ -27,16 +27,55 @@ from rag import load_and_index, get_status, load_vectorstore
 # ──────────────────────────────────────────────
 agent = None
 
+# 向量库就绪信号：后台加载完成后置位。请求侧据此等待，避免启动窗口内的
+# 提问命中尚未加载的向量库、被误判为「知识库为空」。
+_vectorstore_ready: asyncio.Event | None = None
+
+# 等待向量库就绪的上限。超时也放行，由 RAG 工具如实报告检索不到内容。
+VECTORSTORE_WAIT_TIMEOUT = 120.0
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global agent
+    global agent, _vectorstore_ready
+    _vectorstore_ready = asyncio.Event()
+
     print("正在初始化 AI Agent ...")
     agent = await build_agent()
+
+    async def _load_vectorstore_bg():
+        """后台加载向量库，无论成败都置位就绪事件，避免请求被永久挂起。"""
+        try:
+            await asyncio.to_thread(load_vectorstore)
+        except Exception as e:
+            print(f"⚠️ 向量库加载失败：{type(e).__name__}: {e}")
+        finally:
+            _vectorstore_ready.set()
+
     # 向量库加载放入后台任务，不阻塞服务启动
-    asyncio.create_task(asyncio.to_thread(load_vectorstore))
+    asyncio.create_task(_load_vectorstore_bg())
     print("Agent 初始化完成！（向量库后台加载中）")
     yield
+
+
+def _vectorstore_loading() -> bool:
+    """向量库是否仍在后台加载中。"""
+    return _vectorstore_ready is not None and not _vectorstore_ready.is_set()
+
+
+async def _wait_vectorstore(timeout: float = VECTORSTORE_WAIT_TIMEOUT) -> bool:
+    """等向量库加载完成再继续，避免启动窗口内的请求读到空向量库。
+
+    返回是否在超时前就绪；超时也放行，由 RAG 工具如实报告检索不到内容。
+    """
+    if not _vectorstore_loading():
+        return True
+    try:
+        await asyncio.wait_for(_vectorstore_ready.wait(), timeout=timeout)
+        return True
+    except asyncio.TimeoutError:
+        print(f"⚠️ 等待向量库就绪超时（{timeout:.0f}s），本次请求按未就绪放行")
+        return False
 
 
 app = FastAPI(title="AI Agent API", lifespan=lifespan)
@@ -72,10 +111,16 @@ async def health():
     # 1. Agent 状态
     checks["agent"] = "ok" if agent is not None else "uninitialized"
 
-    # 2. 向量库状态
+    # 2. 向量库状态（「加载中」与「确实为空」是两回事，需区分）
     kb = get_status()
+    if _vectorstore_loading():
+        vs_status = "loading"
+    elif kb.get("doc_count", 0) > 0:
+        vs_status = "ok"
+    else:
+        vs_status = "empty"
     checks["vectorstore"] = {
-        "status": "ok" if kb.get("doc_count", 0) > 0 else "empty",
+        "status": vs_status,
         "doc_count": kb.get("doc_count", 0),
         "files": len(kb.get("files", [])),
     }
@@ -125,6 +170,9 @@ async def upload_files(files: list[UploadFile] = File(...)):
     上传 .docx 文件到知识库
     前端用 FormData 发送 files 字段
     """
+    # 等向量库加载完成：否则首次上传会与后台加载并发写同一个向量库
+    await _wait_vectorstore()
+
     results = []
     for upload in files:
         if not upload.filename.lower().endswith(".docx"):
@@ -172,6 +220,10 @@ async def chat_endpoint(req: ChatRequest):
       data: {"type": "error",         "run_id": "xxx", "thread_id": "xxx", "step": "server", "data": {"message": "..."}}
     """
     import uuid
+
+    # 等向量库加载完成，避免启动窗口内的检索命中空向量库、
+    # 让 Agent 如实回答「知识库为空」——那是错误信息而非真实检索结果
+    await _wait_vectorstore()
 
     # 会话 ID：前端传入或自动生成
     thread_id = req.thread_id or uuid.uuid4().hex[:12]
