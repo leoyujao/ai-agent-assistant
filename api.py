@@ -138,7 +138,7 @@ async def health():
     if agent_llm is not None:
         try:
             t0 = time.time()
-            resp = agent_llm.invoke("ping")
+            resp = await agent_llm.ainvoke("ping")
             latency = round((time.time() - t0) * 1000)
             checks["llm"] = {
                 "status": "ok",
@@ -265,4 +265,9 @@ if os.path.isdir(DIST_DIR):
 # ──────────────────────────────────────────────
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    # 同 start_backend.py：默认只监听本机，避免无鉴权接口暴露给同网段
+    uvicorn.run(
+        app,
+        host=os.getenv("HOST", "127.0.0.1"),
+        port=int(os.getenv("PORT", "8000")),
+    )

@@ -19,9 +19,9 @@ from mcp.server.fastmcp import FastMCP
 # 兼容两种启动方式：直接运行（python mcp_servers/search.py）
 # 与模块方式（python -m mcp_servers.search）
 try:
-    from ._common import safe_tool
+    from ._common import ERR_SEARCH_FAILED, safe_tool
 except ImportError:
-    from _common import safe_tool
+    from _common import ERR_SEARCH_FAILED, safe_tool
 
 # 日志输出到 stderr（stdout 为协议通道，严禁占用）
 logging.basicConfig(
@@ -35,7 +35,7 @@ mcp = FastMCP("search")
 
 
 @mcp.tool()
-@safe_tool(error_map={Exception: "搜索出错"})
+@safe_tool(error_map={Exception: ERR_SEARCH_FAILED})
 def web_search(query: str) -> str:
     """
     在互联网上搜索信息。

@@ -76,9 +76,22 @@ JUDGE_PROMPT = """你是一个严格的 AI 评估专家。请对以下 Agent 的
 
 
 def get_llm():
-    """创建评分用 LLM"""
+    """创建评分用 LLM。
+
+    判分模型与被测模型同源时，LLM-as-Judge 会偏向自己写出来的答案
+    （self-preference bias），分数系统性偏高。故单独读 ANTHROPIC_JUDGE_MODEL；
+    未配置时退回被测模型，并明确提示这一偏差。
+    """
+    judge_model = os.getenv("ANTHROPIC_JUDGE_MODEL")
+    tested_model = os.getenv("ANTHROPIC_MODEL", "deepseek-v4-flash")
+    if not judge_model:
+        print(
+            f"⚠️ 未配置 ANTHROPIC_JUDGE_MODEL，将用被测模型（{tested_model}）自评，"
+            "分数可能偏高。建议在 .env 里指定另一个模型作为判分方。"
+        )
+        judge_model = tested_model
     return ChatAnthropic(
-        model=os.getenv("ANTHROPIC_MODEL", "deepseek-v4-flash"),
+        model=judge_model,
         anthropic_api_url=os.getenv("ANTHROPIC_BASE_URL"),
         anthropic_api_key=os.getenv("ANTHROPIC_AUTH_TOKEN"),
         temperature=0.1,  # 低温度保证评分一致性
@@ -133,6 +146,23 @@ def _extract_json(content: str) -> dict:
             pass
 
     raise json.JSONDecodeError("无法从 LLM 回复中提取 JSON", content, 0)
+
+
+def _dim_score(scores: dict, key: str):
+    """取某个维度的分数。
+
+    Judge 偶尔会漏返维度、或把维度写成非对象（如直接给个数字），此时返回 None
+    而不是抛异常——评分结果要到整轮结束才落盘，中途 KeyError 会让前面的结果全丢。
+    """
+    dim = scores.get(key) if isinstance(scores, dict) else None
+    return dim.get("score") if isinstance(dim, dict) else None
+
+
+def _dim_reason(scores: dict, key: str, limit: int = 30) -> str:
+    """取某个维度的评语，缺失时返回空串（同上，报告不因漏字段而中断）。"""
+    dim = scores.get(key) if isinstance(scores, dict) else None
+    reason = dim.get("reason") if isinstance(dim, dict) else None
+    return str(reason)[:limit] if reason else ""
 
 
 def score_single(llm, record: dict, max_retries: int = 2) -> dict:
@@ -209,10 +239,10 @@ def run_scoring(results_path: str, scores_path: str, report_path: str):
 
             scored["judge_scores"] = scores
             scored["has_hallucination"] = has_hallucination
-            ts = scores["tool_selection"]["score"]
-            rq = scores["response_quality"]["score"]
-            sf = scores["safety"]["score"]
-            hl_score = scores["hallucination"].get("score")
+            ts = _dim_score(scores, "tool_selection")
+            rq = _dim_score(scores, "response_quality")
+            sf = _dim_score(scores, "safety")
+            hl_score = _dim_score(scores, "hallucination")
             dims = [s for s in (ts, rq, sf, hl_score) if isinstance(s, (int, float))]
             avg = sum(dims) / len(dims) if dims else 0
             scored["avg_score"] = round(avg, 2)
@@ -258,23 +288,31 @@ def generate_report(scored_records: list[dict], report_path: str):
         print(f"\n📄 报告已保存到：{report_path}")
         return
 
-    # 各维度平均分
-    ts_scores = [r["judge_scores"]["tool_selection"]["score"] for r in valid]
-    rq_scores = [r["judge_scores"]["response_quality"]["score"] for r in valid]
-    sf_scores = [r["judge_scores"]["safety"]["score"] for r in valid]
-    hl_scores = [r["judge_scores"]["hallucination"]["score"] for r in valid
-                 if isinstance(r["judge_scores"]["hallucination"].get("score"), (int, float))]
+    # 各维度平均分（Judge 漏返该维度的用例跳过，不让报告生成崩掉）
+    def _collected(key: str) -> list[float]:
+        return [
+            s for s in (_dim_score(r["judge_scores"], key) for r in valid)
+            if isinstance(s, (int, float))
+        ]
+
+    def _fmt(scores: list[float]) -> str:
+        return f"{sum(scores) / len(scores):.2f}" if scores else "N/A（无有效评分）"
+
+    ts_scores = _collected("tool_selection")
+    rq_scores = _collected("response_quality")
+    sf_scores = _collected("safety")
+    hl_scores = _collected("hallucination")
     avg_scores = [r["avg_score"] for r in valid]
 
     lines.append(f"\n{'─' * 40}")
     lines.append("  整体平均分（满分 5 分）")
     lines.append(f"{'─' * 40}")
-    lines.append(f"  工具选择 (tool_selection)  : {sum(ts_scores)/len(ts_scores):.2f}")
-    lines.append(f"  回复质量 (response_quality): {sum(rq_scores)/len(rq_scores):.2f}")
-    lines.append(f"  安全性   (safety)          : {sum(sf_scores)/len(sf_scores):.2f}")
+    lines.append(f"  工具选择 (tool_selection)  : {_fmt(ts_scores)}")
+    lines.append(f"  回复质量 (response_quality): {_fmt(rq_scores)}")
+    lines.append(f"  安全性   (safety)          : {_fmt(sf_scores)}")
     if hl_scores:
-        lines.append(f"  幻觉控制 (hallucination)  : {sum(hl_scores)/len(hl_scores):.2f}")
-    lines.append(f"  综合均分                    : {sum(avg_scores)/len(avg_scores):.2f}")
+        lines.append(f"  幻觉控制 (hallucination)  : {_fmt(hl_scores)}")
+    lines.append(f"  综合均分                    : {_fmt(avg_scores)}")
 
     # ── 核心指标：幻觉率 ──
     hallucination_count = sum(1 for r in valid if r.get("has_hallucination"))
@@ -311,14 +349,22 @@ def generate_report(scored_records: list[dict], report_path: str):
     lines.append(f"  {'类别':<12} {'数量':>4} {'工具':>6} {'质量':>6} {'安全':>6} {'幻觉':>6} {'均分':>6}")
     lines.append(f"  {'─' * 58}")
 
+    def _mean(values) -> float | None:
+        """只对有效分数求均值；整维缺失时返回 None 而不是拿 0 冒充。"""
+        valid_values = [v for v in values if isinstance(v, (int, float))]
+        return sum(valid_values) / len(valid_values) if valid_values else None
+
+    def _cell(value) -> str:
+        return f"{value:>6.2f}" if isinstance(value, (int, float)) else f"{'N/A':>6}"
+
     for cat, records in categories.items():
         n = len(records)
-        ts = sum(r["judge_scores"]["tool_selection"]["score"] for r in records) / n
-        rq = sum(r["judge_scores"]["response_quality"]["score"] for r in records) / n
-        sf = sum(r["judge_scores"]["safety"]["score"] for r in records) / n
+        ts = _mean(_dim_score(r["judge_scores"], "tool_selection") for r in records)
+        rq = _mean(_dim_score(r["judge_scores"], "response_quality") for r in records)
+        sf = _mean(_dim_score(r["judge_scores"], "safety") for r in records)
         hl = sum(1 for r in records if r.get("has_hallucination"))
         avg = sum(r["avg_score"] for r in records) / n
-        lines.append(f"  {cat:<12} {n:>4} {ts:>6.2f} {rq:>6.2f} {sf:>6.2f} {hl:>4}条 {avg:>6.2f}")
+        lines.append(f"  {cat:<12} {n:>4} {_cell(ts)} {_cell(rq)} {_cell(sf)} {hl:>4}条 {avg:>6.2f}")
 
     # 按难度统计
     lines.append(f"\n{'─' * 40}")
@@ -345,8 +391,8 @@ def generate_report(scored_records: list[dict], report_path: str):
         for r in low_scores:
             lines.append(f"  #{r['id']} [{r['category']}] {r['query'][:40]}... 均分={r['avg_score']}")
             js = r["judge_scores"]
-            lines.append(f"    工具={js['tool_selection']['score']}({js['tool_selection']['reason'][:30]})")
-            lines.append(f"    质量={js['response_quality']['score']}({js['response_quality']['reason'][:30]})")
+            lines.append(f"    工具={_dim_score(js, 'tool_selection')}({_dim_reason(js, 'tool_selection')})")
+            lines.append(f"    质量={_dim_score(js, 'response_quality')}({_dim_reason(js, 'response_quality')})")
 
     # 幻觉用例清单
     hallucination_cases = [r for r in valid if r.get("has_hallucination")]

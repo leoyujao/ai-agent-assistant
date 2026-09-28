@@ -1,4 +1,3 @@
-import functools
 import io
 import json
 import os
@@ -24,30 +23,9 @@ load_dotenv()
 # ──────────────────────────────────────────────
 # 工具统一封装装饰器
 # ──────────────────────────────────────────────
-
-def safe_tool(error_map: dict[type, str] | None = None, max_len: int = 4000):
-    """
-    工具统一封装装饰器，替代裸 try/except。
-
-    - error_map: 细粒度异常映射 {异常类型: 错误前缀}，按声明顺序匹配，未命中走兜底
-    - max_len: 输出截断长度，0 表示不截断
-    """
-    def decorator(func):
-        @functools.wraps(func)
-        def wrapper(*args, **kwargs):
-            try:
-                result = func(*args, **kwargs)
-                if max_len and isinstance(result, str) and len(result) > max_len:
-                    result = result[:max_len] + "\n…（输出过长，已截断）"
-                return result
-            except Exception as e:
-                if error_map:
-                    for exc_type, prefix in error_map.items():
-                        if isinstance(e, exc_type):
-                            return f"{prefix}：{e}"
-                return f"工具执行出错：{type(e).__name__}: {e}"
-        return wrapper
-    return decorator
+# safe_tool 与工具错误文案的唯一实现在 mcp_servers/_common.py：
+# MCP Server 以子进程运行、不能反向 import 本模块，所以共享代码只能放在那一侧。
+from mcp_servers._common import TRUNCATED_SUFFIX, safe_tool  # noqa: F401  (safe_tool 供下方 @tool 使用)
 
 
 # ──────────────────────────────────────────────
@@ -66,8 +44,20 @@ REWRITE_PROMPT = """你是一个查询改写助手。请将用户的原始查询
 直接输出改写后的查询文本："""
 
 
+def _clean_rewrite(response) -> str:
+    """从 LLM 回复里取出改写后的查询，无效改写退回原文。"""
+    rewritten = _extract_text(response.content).strip()
+    if not rewritten or len(rewritten) > 300:
+        return ""
+    return rewritten
+
+
 def rewrite_query(original_query: str) -> str:
-    """使用 LLM 改写用户查询，使其更适合知识库向量检索。"""
+    """使用 LLM 改写用户查询，使其更适合知识库向量检索（同步版）。
+
+    供同步工具 search_knowledge_base 使用；它跑在线程池里，同步调用没问题。
+    事件循环里的调用点请用 arewrite_query，否则会阻塞整个服务。
+    """
     if llm is None:
         return original_query
     try:
@@ -75,11 +65,25 @@ def rewrite_query(original_query: str) -> str:
             {"role": "system", "content": REWRITE_PROMPT},
             {"role": "user", "content": original_query},
         ])
-        rewritten = _extract_text(response.content).strip()
-        # 过滤无效改写
-        if not rewritten or len(rewritten) > 300:
-            return original_query
-        return rewritten
+        return _clean_rewrite(response) or original_query
+    except Exception:
+        return original_query
+
+
+async def arewrite_query(original_query: str) -> str:
+    """rewrite_query 的异步版，供 chat_stream 在事件循环里调用。
+
+    改写要额外付一次 LLM 往返，同步调用会把整个服务（包括其他正在流式的请求）
+    卡住这段时间，故走 ainvoke。
+    """
+    if llm is None:
+        return original_query
+    try:
+        response = await llm.ainvoke([
+            {"role": "system", "content": REWRITE_PROMPT},
+            {"role": "user", "content": original_query},
+        ])
+        return _clean_rewrite(response) or original_query
     except Exception:
         return original_query
 
@@ -305,7 +309,7 @@ def python_executor(code: str) -> str:
 
     result = "\n".join(result_parts)
     if len(result) > 3000:
-        result = result[:3000] + "\n…（输出过长，已截断）"
+        result = result[:3000] + "\n" + TRUNCATED_SUFFIX
     return result
 
 
@@ -602,7 +606,7 @@ async def chat_stream(agent, user_input: str, thread_id: str = "default"):
                 tool_input = event.get("data", {}).get("input", {})
                 if event["name"] == "search_knowledge_base":
                     original_q = tool_input.get("query", "") if isinstance(tool_input, dict) else str(tool_input)
-                    rewritten_q = rewrite_query(original_q)
+                    rewritten_q = await arewrite_query(original_q)
                     _rewrite_cache[original_q] = rewritten_q
                     qr_event = _event("query_rewrite", "rag", {
                         "original": original_q,

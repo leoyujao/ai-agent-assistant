@@ -19,9 +19,9 @@ from mcp.server.fastmcp import FastMCP
 # 兼容两种启动方式：直接运行（python mcp_servers/browser.py）
 # 与模块方式（python -m mcp_servers.browser）
 try:
-    from ._common import safe_tool
+    from ._common import ERR_FETCH_TIMEOUT, ERR_HTTP, safe_tool
 except ImportError:
-    from _common import safe_tool
+    from _common import ERR_FETCH_TIMEOUT, ERR_HTTP, safe_tool
 
 # 日志输出到 stderr（stdout 为协议通道，严禁占用）
 logging.basicConfig(
@@ -59,9 +59,9 @@ def url_reader(url: str) -> str:
         resp.encoding = resp.apparent_encoding
         resp.raise_for_status()
     except requests.exceptions.Timeout:
-        return "访问超时，网页响应时间过长。"
+        return f"{ERR_FETCH_TIMEOUT}，网页响应时间过长。"
     except requests.exceptions.HTTPError as e:
-        return f"HTTP 错误：{e}"
+        return f"{ERR_HTTP}：{e}"
 
     soup = BeautifulSoup(resp.text, "html.parser")
 

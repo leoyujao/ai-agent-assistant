@@ -7,6 +7,15 @@ import time
 import argparse
 import requests
 
+# 错误文案从工具侧引入，避免此处字符串与实现脱节——写死字面量时，
+# 工具改一个错别字就会让「工具是否失败」的判定静默失效、指标虚高。
+from mcp_servers._common import (
+    ERR_FETCH_TIMEOUT,
+    ERR_HTTP,
+    ERR_SEARCH_FAILED,
+    ERR_TOOL_FAILED,
+)
+
 API_URL = "http://localhost:8000/api/chat"
 HEALTH_URL = "http://localhost:8000/api/health"
 DATASET_PATH = "eval_dataset.jsonl"
@@ -17,13 +26,13 @@ REQUIRED_MCP_TOOLS = {"web_search", "url_reader"}
 
 # 工具执行错误特征（启发式检测，与 mcp_servers/ 内工具实现的错误返回文案对应）
 TOOL_ERROR_PATTERNS = [
-    "工具执行出错",                      # safe_tool 兜底异常（mcp_servers/_common.py）
-    "安全限制：",                        # python_executor 黑名单拒绝
-    "错误：表达式包含不允许的字符",      # calculator 非法字符拒绝
-    "搜索出错",                          # web_search 异常（mcp_servers/search.py）
-    "知识库检索出错",                    # search_knowledge_base 异常
-    "访问超时",                          # url_reader 超时（mcp_servers/browser.py）
-    "HTTP 错误",                         # url_reader HTTP 错误（mcp_servers/browser.py）
+    ERR_TOOL_FAILED,                     # safe_tool 兜底异常（mcp_servers/_common.py）
+    "安全限制：",                        # python_executor 黑名单拒绝（agent.py）
+    "错误：表达式包含不允许的字符",      # calculator 非法字符拒绝（agent.py）
+    ERR_SEARCH_FAILED,                   # web_search 异常（mcp_servers/search.py）
+    "知识库检索出错",                    # search_knowledge_base 异常（agent.py）
+    ERR_FETCH_TIMEOUT,                   # url_reader 超时（mcp_servers/browser.py）
+    ERR_HTTP,                            # url_reader HTTP 错误（mcp_servers/browser.py）
 ]
 
 
